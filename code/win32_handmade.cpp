@@ -1,6 +1,7 @@
 #include <windows.h>
 #include <stdint.h> // Returns back precise types for the machine we're on?
 #include <xinput.h>
+#include <dsound.h.>
 
 #define internal static
 #define local_persist static
@@ -8,8 +9,10 @@
 
 typedef uint8_t uint8;
 typedef uint16_t uint16;
+typedef int16_t int16;
 typedef uint32_t uint32;
 typedef uint64_t uint64;
+typedef int32_t int32;
 
 struct window_dimensions {
 	int height;
@@ -25,14 +28,19 @@ struct offscreen_buffer {
 	const int bytesPerPixel = 4;
 };
 
+global_variable bool isRunning = true;
+global_variable offscreen_buffer backBuffer;
+global_variable LPDIRECTSOUNDBUFFER audioBuffer;
+
+// *********************  Begin XInput Aliasing ***********************************//
 // Declares the expected definition for the XINputGetState function defined within the Xinput.h file
 #define X_INPUT_GET_STATE(name) DWORD WINAPI name(DWORD dwUserIndex, XINPUT_STATE *pState)
-// Not sure what this does
+// Aliases the above definition to the name x_input_get_state;
 typedef X_INPUT_GET_STATE(x_input_get_state);
 // Creates a stub method for XInputGetState which simply returns 0;
 X_INPUT_GET_STATE(XInputGetStateStub)
 {
-	return 0;
+	return ERROR_DEVICE_NOT_CONNECTED;
 }
 
 // Create a global pointer pointing at the memory block for the stub on initialization.
@@ -48,19 +56,95 @@ typedef X_INPUT_SET_STATE(x_input_set_state);
 // Creates a stub method for XInputSetState which simply returns 0;
 X_INPUT_SET_STATE(XInputSetStateStub)
 {
-	return 0;
+	return  ERROR_DEVICE_NOT_CONNECTED;
 }
 
 global_variable x_input_set_state *XInputSetState_ = XInputSetStateStub;
 
 #define XInputSetState XInputSetState_
 
-global_variable bool isRunning = true;
-global_variable offscreen_buffer backBuffer;
+// *********************  End XInput Aliasing ***********************************//
 
+// *********************  Begin Direct Sound Aliasing ***********************************//
+
+#define DIRECT_SOUND_CREATE(name) HRESULT WINAPI name(LPCGUID pcGuidDevice, LPDIRECTSOUND *ppDS, LPUNKNOWN pUnkOuter);
+typedef DIRECT_SOUND_CREATE(direct_sound_create);
+
+internal void InitializeSound(HWND window, int32 bufferSize, int32 samplesPerSecond)
+{
+	// First load the library
+	HMODULE library = LoadLibraryA("dsound.dll");
+
+	if(library)
+	{
+		// Get a directSound object.
+		direct_sound_create *directSoundCreate = (direct_sound_create *)GetProcAddress(library, "DirectSoundCreate");
+		LPDIRECTSOUND directSound;
+		if(directSoundCreate && SUCCEEDED(directSoundCreate(0, &directSound, 0)))
+		{
+			WAVEFORMATEX waveformat;
+			waveformat.wFormatTag = WAVE_FORMAT_PCM;
+			waveformat.nChannels = 2;
+			waveformat.nSamplesPerSec = samplesPerSecond;
+			waveformat.wBitsPerSample = 16;
+			waveformat.nBlockAlign = waveformat.nChannels * waveformat.wBitsPerSample / 8;
+			waveformat.nAvgBytesPerSec = waveformat.nSamplesPerSec * waveformat.nBlockAlign;
+			waveformat.cbSize = 0;
+
+			if(SUCCEEDED(directSound->SetCooperativeLevel(window, DSSCL_PRIORITY)))
+			{
+
+				DSBUFFERDESC bufferDescription = {};
+				bufferDescription.dwSize = sizeof(bufferDescription);
+				bufferDescription.dwFlags = DSBCAPS_PRIMARYBUFFER;
+				bufferDescription.dwBufferBytes = 0;
+				// Responsible for creating a handle to the sound card and configures the sound card using the wave format we defined above.
+				// TODO: Is this even necessary now?
+				LPDIRECTSOUNDBUFFER primaryBuffer;
+				if(SUCCEEDED(directSound->CreateSoundBuffer(&bufferDescription, &primaryBuffer, 0)))
+				{
+					if(SUCCEEDED(primaryBuffer->SetFormat(&waveformat)))
+					{
+						OutputDebugStringA("Primary buffer set/n");
+					};
+				}
+			}
+			else{
+				// TODO: log diagnostic
+			}
+
+			DSBUFFERDESC bufferDescription = {};
+			bufferDescription.dwSize = sizeof(bufferDescription);
+			bufferDescription.dwFlags = 0;
+			bufferDescription.dwBufferBytes = bufferSize;
+			bufferDescription.lpwfxFormat = &waveformat;
+
+
+			if(SUCCEEDED(directSound->CreateSoundBuffer(&bufferDescription, &audioBuffer, 0)))
+			{
+				OutputDebugStringA("Secondary buffer created/n");
+			}
+		}
+		else{
+			// TODO: Log direct sound not loaded.
+		}
+		// Create a primary buffer
+
+		// Create a secondary buffer which is what we will actually write to
+
+		// Start playing
+	}
+}
+
+// *********************  End Direct Sound Aliasing ***********************************//
+
+//
 internal void DefineControllerFuntions()
 {
 	HMODULE library = LoadLibrary("xinput1_4.dll");
+	if(!library){
+		library = LoadLibrary("xinput1_3.dll");
+	}
 	if (library)
 	{
 		XInputGetState = (x_input_get_state *)GetProcAddress(library, "XInputGetState");
@@ -125,7 +209,7 @@ internal void ResizeDibSection(offscreen_buffer& buffer, int width, int height)
 
 	int bitmapMemorySize = (buffer.width * buffer.height)* buffer.bytesPerPixel;
 
-	buffer.memory = VirtualAlloc(0, bitmapMemorySize, MEM_COMMIT, PAGE_READWRITE);
+	buffer.memory = VirtualAlloc(0, bitmapMemorySize, MEM_RESERVE|MEM_COMMIT, PAGE_READWRITE);
 }
 
 // Correlates to Win32UpdateWindow from videos
@@ -195,6 +279,12 @@ MainWindowCallback(HWND window, UINT message, WPARAM wParam, LPARAM lParam)
 		else if (virtualKeyCode == VK_ESCAPE) {
 
 		}
+
+		int32 altKeyIsDown = (lParam & (1 << 29));
+		if(virtualKeyCode == VK_F4 && altKeyIsDown){
+			isRunning = false;
+		}
+
 	}
 	break;
 	case WM_PAINT:
@@ -236,7 +326,20 @@ int CALLBACK WinMain(HINSTANCE instance, HINSTANCE previousInstance, LPSTR comma
 
 		if (handle)
 		{
-			int blueOffset = 0, greenOffset = 0;
+			int samplesPerSecond = 48000;
+			int blueOffset = 0,
+					greenOffset = 0;
+			uint32 runningSampleIndex = 0;
+			int hertz = 256;
+			int squareWavePeriod = samplesPerSecond / hertz;
+			int halfPeriod = squareWavePeriod / 2;
+			int bytesPerSample = sizeof(int16) * 2;
+			int audioBufferSize = samplesPerSecond * bytesPerSample;
+			int16 toneVolume = 6000;
+
+			InitializeSound(handle, samplesPerSecond, audioBufferSize);
+			audioBuffer->Play(0, 0, 0);
+
 			MSG message;
 			BOOL messageResult;
 			while (isRunning) {
@@ -294,6 +397,52 @@ int CALLBACK WinMain(HINSTANCE instance, HINSTANCE previousInstance, LPSTR comma
 				}
 
 				renderGradient(backBuffer, blueOffset++, greenOffset);
+
+				// DirectSound output test
+				DWORD playCursor;
+				DWORD writeCurser;
+				if(SUCCEEDED(audioBuffer->GetCurrentPosition(&playCursor, &writeCurser)))
+				{
+					DWORD byteToLock = runningSampleIndex * bytesPerSample % samplesPerSecond;
+					int32 bytesToWrite;
+					if(byteToLock > playCursor)
+					{
+						bytesToWrite = (audioBufferSize - byteToLock);
+						bytesToWrite += playCursor;
+					}
+					else{
+						bytesToWrite = playCursor - byteToLock;
+					}
+
+					VOID *region1;
+					DWORD region1Size;
+					VOID *region2;
+					DWORD region2Size;
+
+
+					HRESULT  response = audioBuffer->Lock(byteToLock, bytesToWrite, &region1, &region1Size, &region2, &region2Size, 0);
+					if(SUCCEEDED(response))
+					{
+						int16 *sampleOutput = (int16 *)region1;
+						DWORD region1SampleCount = region1Size / bytesPerSample;
+						for (int32 sampleIndex = 0; sampleIndex < region1SampleCount; sampleIndex++)
+						{
+							int16 sampleValue = ((runningSampleIndex++ > halfPeriod) % 2) ? toneVolume : -toneVolume;
+							*sampleOutput++ = sampleValue;
+							*sampleOutput++ = sampleValue;
+						}
+
+						DWORD region2SampleCount = region2Size / bytesPerSample;
+						for (int32 sampleIndex = 0; sampleIndex < region2SampleCount; sampleIndex++)
+						{
+							int16 sampleValue = ((runningSampleIndex++ > halfPeriod) % 2) ? toneVolume : -toneVolume;
+							*sampleOutput++ = sampleValue;
+							*sampleOutput++ = sampleValue;
+						}
+
+						audioBuffer->Unlock(region1, region1Size, region2, region2Size);
+					}
+				}
 
 				HDC deviceContext = GetDC(handle);
 				window_dimensions updateScreen = GetWindowDimensions(handle);
